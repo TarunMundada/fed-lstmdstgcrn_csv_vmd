@@ -1,13 +1,12 @@
 """
 Federated LSTM-DSTGCRN — fixed per-client node-subset handling.
+Extended baseline to (1) log both MAE and RMSE and (2) optionally apply
+multi-head temporal self-attention before the GraphConvLSTM.
 
-How this fix works:
-- Global model has num_nodes = full N (all columns in trip CSV).
-- Clients are assigned node subsets (indices into 0..N-1).
-- Each client's dataset returns windows shaped [T_in, N_sub, F].
-- Before passing a batch to the model, we pad it to [B, T_in, N_full, F],
-  placing the client's node columns into their indices. All other node columns are zeros.
-- This lets every client and the server use identical model shapes so FedAvg aggregation works.
+Run example:
+python federated_lstm_dstgcrn_baseline.py --trip_csv CHI-taxi/tripdata_full.csv \
+  --dataset CHI-Taxi --rounds 10 --clients 3 --tin 12 --tout 3 \
+  --epochs_per_round 2 --batch_size 16 --use_attention 1
 """
 from __future__ import annotations
 import os, copy, math, json, argparse, random
@@ -61,6 +60,28 @@ class GraphConv(nn.Module):
         return self.lin(x_mp)
 
 # ================================================================
+# Optional: Multi-head temporal self-attention (per node)
+# ================================================================
+class TemporalMHA(nn.Module):
+    """Applies MHA along time for each node independently.
+    Input  x: [B,T,N,C] -> output [B,T,N,C]
+    Uses nn.MultiheadAttention with batch_first=True.
+    """
+    def __init__(self, dim: int, num_heads: int = 4, dropout: float = 0.0):
+        super().__init__()
+        self.mha = nn.MultiheadAttention(embed_dim=dim, num_heads=num_heads,
+                                         dropout=dropout, batch_first=True)
+        self.ln = nn.LayerNorm(dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, T, N, C = x.shape
+        x_ = x.permute(0, 2, 1, 3).reshape(B * N, T, C)  # [B*N,T,C]
+        out, _ = self.mha(x_, x_, x_, need_weights=False)
+        out = self.ln(out + x_)
+        out = out.reshape(B, N, T, C).permute(0, 2, 1, 3)  # [B,T,N,C]
+        return out
+
+# ================================================================
 # GraphConvLSTM cell
 # ================================================================
 class GraphConvLSTMCell(nn.Module):
@@ -95,11 +116,16 @@ class LSTMDSTGCRN(nn.Module):
         horizon: int = 3,
         num_layers: int = 1,
         emb_dim: int = 16,
+        use_attention: bool = False,
+        attn_heads: int = 4,
     ):
         super().__init__()
         self.num_nodes = num_nodes
         self.horizon = horizon
         self.adaptiveA = AdaptiveAdjacency(num_nodes, emb_dim)
+        self.use_attention = use_attention
+        if use_attention:
+            self.attn = TemporalMHA(dim=input_dim, num_heads=attn_heads)
 
         cells = []
         for l in range(num_layers):
@@ -115,12 +141,16 @@ class LSTMDSTGCRN(nn.Module):
             "cells": self.cells,
             "proj": self.proj,
         }
+        if use_attention:
+            self.modules_to_integrate["attn"] = self.attn
 
     def forward(self, x):
         # x: [B,T,N,C]
         B, T, N, C = x.shape
-        # model expects N == self.num_nodes
         assert N == self.num_nodes, f"Input N={N} but model expects {self.num_nodes}"
+        if self.use_attention:
+            x = self.attn(x)  # temporal self-attention per node
+
         A = self.adaptiveA()  # [N,N]
 
         hs = [x.new_zeros(B, N, c.hidden_dim) for c in self.cells]
@@ -243,18 +273,33 @@ def pad_batch_to_full(x_sub: torch.Tensor, subset_idx: List[int], N_full: int):
     return x_full, mask
 
 # ================================================================
-# Train / Eval helpers (adjusted to accept subset padding)
+# Train / Eval helpers (now compute MAE & RMSE)
 # ================================================================
+def _masked_mae(y_hat, y, mask=None):
+    if mask is None:
+        return (y_hat - y).abs().mean()
+    else:
+        abs_diff = (y_hat - y).abs() * mask
+        return abs_diff.sum() / mask.sum().clamp_min(1.0)
+
+
+def _masked_rmse(y_hat, y, mask=None):
+    if mask is None:
+        return torch.sqrt(((y_hat - y) ** 2).mean())
+    else:
+        sq = ((y_hat - y) ** 2) * mask
+        return torch.sqrt(sq.sum() / mask.sum().clamp_min(1.0))
+
+
 def train_one_epoch(model, loader, optimizer, device, subset_idx=None, N_full=None):
     model.train()
-    total_abs = 0.0
-    total_count = 0.0
+    total_loss = 0.0
+    total_count = 0
 
     for x, y in loader:
         if subset_idx is not None:
             x_full, mask = pad_batch_to_full(x, subset_idx, N_full)
             y_full, _ = pad_batch_to_full(y, subset_idx, N_full)
-            # Fix mask time dimension
             if mask.shape[1] != y_full.shape[1]:
                 mask = mask[:, :y_full.shape[1], :, :]
             x, y, mask = to_device(x_full, device), to_device(y_full, device), to_device(mask, device)
@@ -264,34 +309,28 @@ def train_one_epoch(model, loader, optimizer, device, subset_idx=None, N_full=No
 
         optimizer.zero_grad()
         y_hat = model(x)
-
-        if mask is None:
-            loss = F.l1_loss(y_hat, y)
-        else:
-            abs_diff = (y_hat - y).abs() * mask
-            loss = abs_diff.sum() / mask.sum()
-
+        loss = _masked_mae(y_hat, y, mask)
         loss.backward()
         nn.utils.clip_grad_norm_(model.parameters(), 5.0)
         optimizer.step()
 
-        total_abs += loss.item() * x.size(0)
+        total_loss += loss.item() * x.size(0)
         total_count += x.size(0)
 
-    return total_abs / total_count
+    return total_loss / max(total_count, 1)
 
 
 @torch.no_grad()
 def evaluate(model, loader, device, subset_idx=None, N_full=None):
     model.eval()
-    total_abs = 0.0
-    total_count = 0.0
+    total_mae = 0.0
+    total_rmse = 0.0
+    total_batches = 0
 
     for x, y in loader:
         if subset_idx is not None:
             x_full, mask = pad_batch_to_full(x, subset_idx, N_full)
             y_full, _ = pad_batch_to_full(y, subset_idx, N_full)
-            # Fix mask time dimension to match y_full / y_hat
             if mask.shape[1] != y_full.shape[1]:
                 mask = mask[:, :y_full.shape[1], :, :]
             x, y, mask = to_device(x_full, device), to_device(y_full, device), to_device(mask, device)
@@ -300,15 +339,15 @@ def evaluate(model, loader, device, subset_idx=None, N_full=None):
             x, y = to_device(x, device), to_device(y, device)
 
         y_hat = model(x)
-        if mask is None:
-            total_abs += (y_hat - y).abs().sum().item()
-            total_count += torch.prod(torch.tensor(y.shape)).item()
-        else:
-            abs_diff = (y_hat - y).abs() * mask
-            total_abs += abs_diff.sum().item()
-            total_count += mask.sum().item()
+        mae = _masked_mae(y_hat, y, mask)
+        rmse = _masked_rmse(y_hat, y, mask)
+        total_mae += mae.item()
+        total_rmse += rmse.item()
+        total_batches += 1
 
-    return total_abs / total_count if total_count > 0 else float('nan')
+    if total_batches == 0:
+        return {"mae": float("nan"), "rmse": float("nan")}
+    return {"mae": total_mae / total_batches, "rmse": total_rmse / total_batches}
 
 
 # ================================================================
@@ -318,6 +357,7 @@ def _copy_group(dst: nn.Module, src: nn.Module, group_name: str):
     dst_group = dst.modules_to_integrate[group_name]
     src_group = src.modules_to_integrate[group_name]
     dst_group.load_state_dict(src_group.state_dict())
+
 
 def selective_integration(local_model, global_model, val_loader, device, subset_idx: Optional[List[int]] = None, N_full: Optional[int] = None, groups=None):
     if groups is None:
@@ -330,7 +370,8 @@ def selective_integration(local_model, global_model, val_loader, device, subset_
     for g in groups:
         cand = copy.deepcopy(base)
         _copy_group(cand, global_model, g)
-        loss = evaluate(cand, val_loader, device, subset_idx=subset_idx, N_full=N_full)
+        metrics = evaluate(cand, val_loader, device, subset_idx=subset_idx, N_full=N_full)
+        loss = metrics["mae"]
         if loss < best_loss:
             best_loss, best_group = loss, g
 
@@ -353,7 +394,6 @@ class FLClient:
         self.cid = cid
         self.device = device
         self.cfg = cfg
-        # Each client **creates a model with full node count** to match server/global shape
         self.model = model_fn().to(device)
         self.train_loader = DataLoader(train_ds, batch_size=cfg.batch_size, shuffle=True, collate_fn=collate_batch)
         self.val_loader   = DataLoader(val_ds,   batch_size=cfg.batch_size, shuffle=False, collate_fn=collate_batch)
@@ -365,7 +405,6 @@ class FLClient:
         self.model.load_state_dict(global_model.state_dict())
 
     def integrate(self, global_model):
-        # selective integration uses validation loader but pads batches before eval
         self.model = selective_integration(self.model, global_model, self.val_loader, self.device, subset_idx=self.subset_idx, N_full=self.N_full)
 
     def train_local(self):
@@ -380,21 +419,20 @@ class FLClient:
     def n_test(self):  return len(self.test_loader.dataset)
 
     @torch.no_grad()
-    def test_mae(self):
+    def test_metrics(self):
         return evaluate(self.model, self.test_loader, self.device, subset_idx=self.subset_idx, N_full=self.N_full)
 
     @torch.no_grad()
-    def train_loss_eval(self):
+    def train_metrics(self):
         return evaluate(self.model, self.train_loader, self.device, subset_idx=self.subset_idx, N_full=self.N_full)
 
 class FLServer:
-    def __init__(self, model_fn, clients: List[FLClient], N_full: int):
+    def __init__(self, model_fn, N_full: int):
         self.global_model = model_fn()
-        self.clients = clients
         self.N_full = N_full
 
-    def distribute(self):
-        for c in self.clients:
+    def distribute(self, clients: List[FLClient]):
+        for c in clients:
             c.set_params_from(self.global_model)
 
     def aggregate_fedavg(self, states: List[Tuple[Dict, int]]):
@@ -417,6 +455,9 @@ def run_federated(
     device: str = None,
     save_dir: str = "./ckpts",
     epochs_per_round: int = 2,
+    batch_size: int = 16,
+    use_attention: int = 0,
+    attn_heads: int = 3,
 ):
     os.makedirs(save_dir, exist_ok=True)
     set_seed(42)
@@ -424,7 +465,6 @@ def run_federated(
 
     # infer N (nodes) and build node index list [0..N-1]
     tmp = pd.read_csv(trip_csv, nrows=1)
-    # assume 'timestamp' column present
     node_cols = [c for c in tmp.columns if c != "timestamp"]
     N_full = len(node_cols)
     node_indices = list(range(N_full))
@@ -432,12 +472,12 @@ def run_federated(
     # round-robin split nodes among clients
     chunks = [node_indices[i::num_clients] for i in range(num_clients)]
 
-    # model factory (input_dim=6 features as built in loader)
     def model_fn():
         return LSTMDSTGCRN(num_nodes=N_full, input_dim=6, hidden_dim=64,
-                           output_dim=1, horizon=output_len, num_layers=1, emb_dim=16)
+                           output_dim=1, horizon=output_len, num_layers=1, emb_dim=16,
+                           use_attention=bool(use_attention), attn_heads=attn_heads)
 
-    # build clients (each keeps only its node subset in datasets but creates full-size models)
+    # build clients
     clients: List[FLClient] = []
     for cid, subset in enumerate(chunks):
         full_ds = TripWeatherDataset(trip_csv, input_len, output_len, stride=1, node_subset=subset)
@@ -450,37 +490,45 @@ def run_federated(
         tr, va, te = torch.utils.data.random_split(
             full_ds, [n_tr, n_va, n_te], generator=torch.Generator().manual_seed(123 + cid)
         )
-        cfg = ClientConfig(id=cid, epochs=epochs_per_round, batch_size=32, lr=1e-3)
+        cfg = ClientConfig(id=cid, epochs=epochs_per_round, batch_size=batch_size, lr=1e-3)
         clients.append(FLClient(cid, model_fn, tr, va, te, cfg, device, subset_idx=subset, N_full=N_full))
 
-    server = FLServer(model_fn, clients, N_full=N_full)
+    server = FLServer(model_fn, N_full=N_full)
 
     # logs for paper-style
-    global_log = []     # [{"round": r, "global_mae": .., "global_loss": ..}, ...]
+    global_log = []     # [{round, global_mae, global_rmse, global_train_mae, global_train_rmse}, ...]
 
     for r in range(num_rounds):
         print(f"\n===== Round {r+1}/{num_rounds} | {dataset_name} =====")
 
         # send current global model
-        server.distribute()
+        server.distribute(clients)
 
         # client-side selective integration + local training
         for c in clients:
             c.integrate(server.global_model)
             c.train_local()
 
-        # Weighted global training loss (evaluate on each client's TRAIN set)
-        train_losses = [(c.train_loss_eval(), c.n_train()) for c in clients]
-        total_train = sum(n for _, n in train_losses)
-        global_train_loss = sum(l * n for l, n in train_losses) / total_train
+        # Weighted global training metrics (evaluate on each client's TRAIN set)
+        train_metrics = [(c.train_metrics(), c.n_train()) for c in clients]
+        total_train = sum(n for _, n in train_metrics)
+        global_train_mae = sum(m["mae"] * n for m, n in train_metrics) / total_train
+        global_train_rmse = sum(m["rmse"] * n for m, n in train_metrics) / total_train
 
-        # Evaluate test MAE per client
-        test_results = [(c.test_mae(), c.n_test()) for c in clients]
+        # Evaluate test metrics per client
+        test_results = [(c.test_metrics(), c.n_test()) for c in clients]
         total_test = sum(n for _, n in test_results)
-        global_mae = sum(mae * n for mae, n in test_results) / total_test
+        global_mae = sum(m["mae"] * n for m, n in test_results) / total_test
+        global_rmse = sum(m["rmse"] * n for m, n in test_results) / total_test
 
-        print(f"Global MAE: {global_mae:.4f} | Global train loss: {global_train_loss:.4f}")
-        global_log.append({"round": r, "global_mae": float(global_mae), "global_loss": float(global_train_loss)})
+        print(f"Global MAE: {global_mae:.4f} | Global RMSE: {global_rmse:.4f} | Train MAE: {global_train_mae:.4f}")
+        global_log.append({
+            "round": r,
+            "global_mae": float(global_mae),
+            "global_rmse": float(global_rmse),
+            "global_train_mae": float(global_train_mae),
+            "global_train_rmse": float(global_train_rmse),
+        })
 
         # FedAvg aggregation (weighted by train samples)
         states = [(c.state_dict(), c.n_train()) for c in clients]
@@ -492,23 +540,27 @@ def run_federated(
         json.dump(global_log, f, indent=2)
     print(f"Saved global results to {json_path}")
 
-    # Plot and save the single loss curve for this dataset
+    # Plot and save the curves for this dataset
     rounds = [r["round"] for r in global_log]
-    losses = [r["global_loss"] for r in global_log]
+    maes = [r["global_mae"] for r in global_log]
+    rmses = [r["global_rmse"] for r in global_log]
+
     plt.figure()
-    plt.plot(rounds, losses, label=f"{dataset_name}")
+    plt.plot(rounds, maes, label=f"{dataset_name} MAE")
+    plt.plot(rounds, rmses, label=f"{dataset_name} RMSE")
     plt.xlabel("Round")
-    plt.ylabel("Training loss")
-    plt.title(f"Training loss ({dataset_name})")
+    plt.ylabel("Metric")
+    plt.title(f"Global Metrics ({dataset_name})")
     plt.legend()
-    png_path = os.path.join(save_dir, f"{dataset_name}_loss_curve.png")
+    png_path = os.path.join(save_dir, f"{dataset_name}_metrics.png")
     plt.savefig(png_path, bbox_inches="tight")
     plt.close()
-    print(f"Saved loss curve to {png_path}")
+    print(f"Saved metrics curves to {png_path}")
 
 # ================================================================
 # CLI
 # ================================================================
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--trip_csv", required=True, help="Path to *tripdata*_full.csv (e.g., 'CHI-taxi/tripdata_full.csv')")
@@ -518,6 +570,9 @@ def main():
     ap.add_argument("--tin", type=int, default=12)
     ap.add_argument("--tout", type=int, default=3)
     ap.add_argument("--epochs_per_round", type=int, default=2)
+    ap.add_argument("--batch_size", type=int, default=16)
+    ap.add_argument("--use_attention", type=int, default=0, help="1 to enable temporal MHA pre-encoder")
+    ap.add_argument("--attn_heads", type=int, default=4)
     ap.add_argument("--save_dir", default="./ckpts")
     args = ap.parse_args()
 
@@ -529,6 +584,9 @@ def main():
         input_len=args.tin,
         output_len=args.tout,
         epochs_per_round=args.epochs_per_round,
+        batch_size=args.batch_size,
+        use_attention=args.use_attention,
+        attn_heads=args.attn_heads,
         save_dir=args.save_dir,
     )
 
