@@ -1,14 +1,3 @@
-"""
-Federated LSTM-DSTGCRN — fixed per-client node-subset handling.
-Extended baseline to (1) log both MAE and RMSE and (2) optionally apply
-multi-head temporal self-attention before the GraphConvLSTM.
-
-Run example:
-python federated_lstm_dstgcrn_baseline.py --trip_csv CHI-taxi/tripdata_full.csv \
-  --dataset CHI-Taxi --rounds 10 --clients 3 --tin 12 --tout 3 \
-  --epochs_per_round 2 --batch_size 16 --use_attention 1
-"""
-from __future__ import annotations
 import os, copy, math, json, argparse, random
 from dataclasses import dataclass
 from typing import Dict, List, Tuple, Optional
@@ -21,6 +10,21 @@ from torch.utils.data import DataLoader, Dataset
 import pandas as pd
 import matplotlib.pyplot as plt
 from sklearn.preprocessing import OneHotEncoder
+
+# ================================================================
+# Optional: VMD import (pip install vmdpy)
+# ================================================================
+try:
+    from vmdpy import VMD
+except Exception:
+    VMD = None
+
+def apply_vmd(signal: np.ndarray, K: int = 3, alpha=2000, tau=0., DC=0, init=1, tol=1e-7):
+    """Apply VMD to a 1D signal, return K modes shaped [K, T]."""
+    if VMD is None:
+        raise ImportError("vmdpy not installed. Install with: pip install vmdpy")
+    u, _, _ = VMD(signal, alpha, tau, K, DC, init, tol)
+    return u  # [K, T]
 
 # ================================================================
 # Utils
@@ -46,8 +50,8 @@ class AdaptiveAdjacency(nn.Module):
         self.E2 = nn.Parameter(torch.randn(num_nodes, emb_dim) * 0.1)
 
     def forward(self):
-        logits = F.relu(self.E1 @ self.E2.t())            # [N,N]
-        return F.softmax(logits, dim=-1)                  # row-normalized
+        logits = F.relu(self.E1 @ self.E2.t())  # [N,N]
+        return F.softmax(logits, dim=-1)
 
 class GraphConv(nn.Module):
     def __init__(self, in_channels: int, out_channels: int, bias: bool = True):
@@ -56,30 +60,8 @@ class GraphConv(nn.Module):
 
     def forward(self, x: torch.Tensor, A: torch.Tensor) -> torch.Tensor:
         # x: [B,N,C], A: [N,N]
-        x_mp = torch.einsum("ij,bjc->bic", A, x)          # message passing
+        x_mp = torch.einsum("ij,bjc->bic", A, x)
         return self.lin(x_mp)
-
-# ================================================================
-# Optional: Multi-head temporal self-attention (per node)
-# ================================================================
-class TemporalMHA(nn.Module):
-    """Applies MHA along time for each node independently.
-    Input  x: [B,T,N,C] -> output [B,T,N,C]
-    Uses nn.MultiheadAttention with batch_first=True.
-    """
-    def __init__(self, dim: int, num_heads: int = 4, dropout: float = 0.0):
-        super().__init__()
-        self.mha = nn.MultiheadAttention(embed_dim=dim, num_heads=num_heads,
-                                         dropout=dropout, batch_first=True)
-        self.ln = nn.LayerNorm(dim)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        B, T, N, C = x.shape
-        x_ = x.permute(0, 2, 1, 3).reshape(B * N, T, C)  # [B*N,T,C]
-        out, _ = self.mha(x_, x_, x_, need_weights=False)
-        out = self.ln(out + x_)
-        out = out.reshape(B, N, T, C).permute(0, 2, 1, 3)  # [B,T,N,C]
-        return out
 
 # ================================================================
 # GraphConvLSTM cell
@@ -106,6 +88,7 @@ class GraphConvLSTMCell(nn.Module):
 class LSTMDSTGCRN(nn.Module):
     """
     x: [B,T_in,N,C_in] -> y: [B,T_out,N,C_out]
+    If using VMD and predicting IMFs: C_out = K (number of modes). Otherwise C_out = 1.
     """
     def __init__(
         self,
@@ -117,7 +100,7 @@ class LSTMDSTGCRN(nn.Module):
         num_layers: int = 1,
         emb_dim: int = 16,
         use_attention: bool = False,
-        attn_heads: int = 4,
+        num_heads: int = 2,
     ):
         super().__init__()
         self.num_nodes = num_nodes
@@ -125,7 +108,10 @@ class LSTMDSTGCRN(nn.Module):
         self.adaptiveA = AdaptiveAdjacency(num_nodes, emb_dim)
         self.use_attention = use_attention
         if use_attention:
-            self.attn = TemporalMHA(dim=input_dim, num_heads=attn_heads)
+            assert input_dim % num_heads == 0, "input_dim must be divisible by num_heads"
+            self.attn = nn.MultiheadAttention(embed_dim=input_dim, num_heads=num_heads, batch_first=True)
+        else:
+            self.attn = None
 
         cells = []
         for l in range(num_layers):
@@ -135,23 +121,25 @@ class LSTMDSTGCRN(nn.Module):
 
         self.proj = nn.Linear(hidden_dim, output_dim * horizon)
 
-        # expose groups for Algorithm 2
+        # expose groups for selective integration
         self.modules_to_integrate = {
             "adaptiveA": self.adaptiveA,
             "cells": self.cells,
             "proj": self.proj,
         }
-        if use_attention:
+        if self.attn is not None:
             self.modules_to_integrate["attn"] = self.attn
 
     def forward(self, x):
         # x: [B,T,N,C]
         B, T, N, C = x.shape
         assert N == self.num_nodes, f"Input N={N} but model expects {self.num_nodes}"
-        if self.use_attention:
-            x = self.attn(x)  # temporal self-attention per node
-
         A = self.adaptiveA()  # [N,N]
+
+        if self.attn is not None:
+            x_flat = x.permute(0, 2, 1, 3).reshape(B * N, T, C)
+            x_attn, _ = self.attn(x_flat, x_flat, x_flat)
+            x = x_attn.reshape(B, N, T, C).permute(0, 2, 1, 3)
 
         hs = [x.new_zeros(B, N, c.hidden_dim) for c in self.cells]
         cs = [x.new_zeros(B, N, c.hidden_dim) for c in self.cells]
@@ -163,18 +151,22 @@ class LSTMDSTGCRN(nn.Module):
                 hs[i], cs[i] = h, c
                 xt = h
 
-        out = self.proj(hs[-1])                     # [B,N, C_out*horizon]
+        out = self.proj(hs[-1])  # [B,N, C_out*horizon]
         out = out.view(B, N, self.horizon, -1).permute(0, 2, 1, 3)  # [B,T_out,N,C_out]
         return out
 
 # ================================================================
-# Dataset (matches original loader; optional node subset)
+# Dataset (with optional VMD preprocessing)
 # ================================================================
 class TripWeatherDataset(Dataset):
     """
-    Builds features like the original code:
-      [trips, temperature, precipitation, hour_norm, day_in_week_norm, weekend_flag]
-    If node_subset is provided (list of column indices), the dataset will return windows with N_sub nodes.
+    Builds features per the paper. Two modes:
+      - VMD disabled (vmd_k=0): features = [trips, temperature, precipitation, hour_norm, day_norm, weekend]
+      - VMD enabled (vmd_k=K):  features = [IMF_1..IMF_K, temperature, precipitation, hour_norm, day_norm, weekend]
+
+    Targets always return both:
+      - y_imfs: IMF stack (when K>0) or trips (when K=0)  -> used by model output
+      - y_trips: raw trips (for reconstruction loss & metrics)
     """
     def __init__(
         self,
@@ -182,12 +174,15 @@ class TripWeatherDataset(Dataset):
         input_len: int = 12,
         output_len: int = 3,
         stride: int = 1,
-        node_subset: Optional[List[int]] = None,  # indices 0..N-1
+        node_subset: Optional[List[int]] = None,
+        vmd_k: int = 0,
+        save_vmd: bool = True,
     ):
         self.T_in = input_len
         self.T_out = output_len
         self.stride = stride
         self.node_subset = None if node_subset is None else list(node_subset)
+        self.vmd_k = int(vmd_k)
 
         trips = pd.read_csv(trip_csv)
         weather_csv = trip_csv.replace("tripdata", "weatherdata")
@@ -200,27 +195,47 @@ class TripWeatherDataset(Dataset):
         trips = trips.set_index("timestamp")
         weathers = weathers.set_index("timestamp")
 
-        trips_np = trips.to_numpy()          # [T, N]
-        weathers_np = weathers.to_numpy()    # [T, 2N] -> (temp, precip) alternating
+        trips_np = trips.to_numpy()            # [T, N]
+        weathers_np = weathers.to_numpy()      # [T, 2N]
 
-        # time features
-        weekends = trips.index.dayofweek.isin([5, 6])
+        # ---------- Time/aux features ----------
+        weekends = trips.index.dayofweek.isin([5, 6]).astype(int)
         enc = OneHotEncoder(sparse_output=False)
-        weekend_1hot = enc.fit_transform(weekends.reshape(-1, 1))[:, 1].reshape(-1, 1)
+        weekend_1hot = enc.fit_transform(weekends.reshape(-1, 1))[:, 0].reshape(-1, 1)
         weekend_1hot = np.repeat(weekend_1hot[:, np.newaxis, :], trips_np.shape[1], axis=1)  # [T,N,1]
-
         day_norm = (trips.index.dayofweek.to_numpy() / 7.0)
         day_norm = np.repeat(day_norm[:, None], trips_np.shape[1], axis=1)
-
         hour_norm = (trips.index.hour.to_numpy() / 24.0)
         hour_norm = np.repeat(hour_norm[:, None], trips_np.shape[1], axis=1)
-
         temperature = weathers_np[:, ::2]
         precipitation = weathers_np[:, 1::2]
 
+        # ---------- Primary feature block (trips vs VMD IMFs) ----------
+        if self.vmd_k > 0:
+            # VMD decomposition per node
+            imf_list = []
+            for j in range(trips_np.shape[1]):
+                modes = apply_vmd(trips_np[:, j], K=self.vmd_k)  # [K, T]
+                imf_list.append(modes)
+            imfs_stacked = np.stack(imf_list, axis=1).transpose(2, 1, 0)  # [T, N, K]
+
+            # Save once per file (avoid duplicates across clients)
+            vmd_path = trip_csv.replace("tripdata", f"tripdata_vmd{self.vmd_k}")
+            if save_vmd and not os.path.exists(vmd_path):
+                vmd_df = pd.DataFrame(imfs_stacked.reshape(imfs_stacked.shape[0], -1))
+                vmd_df.to_csv(vmd_path, index=False)
+                print(f"Saved VMD-preprocessed trips to {vmd_path}")
+
+            primary = imfs_stacked  # [T,N,K]
+            y_imfs_full = imfs_stacked  # [T,N,K]
+        else:
+            primary = trips_np[:, :, None]  # [T,N,1]
+            y_imfs_full = primary  # treat trips as single-channel output
+
+        # Build full feature tensor
         data = np.concatenate(
             (
-                trips_np[:, :, None],
+                primary,
                 temperature[:, :, None],
                 precipitation[:, :, None],
                 hour_norm[:, :, None],
@@ -228,41 +243,50 @@ class TripWeatherDataset(Dataset):
                 weekend_1hot,
             ),
             axis=2,
-        )  # [T,N,F]
+        )  # [T,N, (K or 1) + 5]
 
-        # If node_subset provided, keep only those columns for returned windows
+        # Optionally subset nodes for this client
         if self.node_subset is not None:
-            data_sub = data[:, self.node_subset, :]   # [T, N_sub, F]
+            data_sub = data[:, self.node_subset, :]
+            y_imfs_sub = y_imfs_full[:, self.node_subset, :]
+            trips_sub = trips_np[:, self.node_subset][:, :, None]
         else:
-            data_sub = data  # full
+            data_sub = data
+            y_imfs_sub = y_imfs_full
+            trips_sub = trips_np[:, :, None]
 
-        self.data = torch.tensor(data_sub, dtype=torch.float32)
-        self.targets = self.data[:, :, 0:1]  # trips channel
+        self.data = torch.tensor(data_sub, dtype=torch.float32)          # [T,N,F]
+        self.y_imfs = torch.tensor(y_imfs_sub, dtype=torch.float32)      # [T,N,K or 1]
+        self.y_trips = torch.tensor(trips_sub, dtype=torch.float32)      # [T,N,1]
 
-        # windows
-        T = self.data.shape[0]
+        # window indices
+        Ttot = self.data.shape[0]
         self.windows = []
-        for s in range(0, T - (self.T_in + self.T_out) + 1, self.stride):
-            x = self.data[s : s + self.T_in]                        # [T_in, N_sub, F]
-            y = self.targets[s + self.T_in : s + self.T_in + self.T_out]  # [T_out, N_sub, 1]
-            self.windows.append((x, y))
+        for s in range(0, Ttot - (self.T_in + self.T_out) + 1, self.stride):
+            x = self.data[s: s + self.T_in]                                   # [T_in,N,F]
+            y_imf = self.y_imfs[s + self.T_in: s + self.T_in + self.T_out]    # [T_out,N,K or 1]
+            y_trip = self.y_trips[s + self.T_in: s + self.T_in + self.T_out]  # [T_out,N,1]
+            self.windows.append((x, y_imf, y_trip))
 
-    def __len__(self): return len(self.windows)
-    def __getitem__(self, idx): return self.windows[idx]
+    def __len__(self):
+        return len(self.windows)
+
+    def __getitem__(self, idx):
+        return self.windows[idx]
+
+# ---------------------------------------------------------------
+# Collate and padding helpers
+# ---------------------------------------------------------------
 
 def collate_batch(batch):
-    xs, ys = zip(*batch)
-    return torch.stack(xs, 0), torch.stack(ys, 0)  # x:[B,T,N_sub,F], y:[B,T_out,N_sub,1]
+    xs, y_imfs, y_trips = zip(*batch)
+    return torch.stack(xs, 0), (torch.stack(y_imfs, 0), torch.stack(y_trips, 0))
 
-# ================================================================
-# Padding helper (pad batch from N_sub -> N_full according to indices)
-# ================================================================
+
 def pad_batch_to_full(x_sub: torch.Tensor, subset_idx: List[int], N_full: int):
     """
-    x_sub: [B,T,N_sub,C], subset_idx: list length N_sub with positions in 0..N_full-1
-    returns:
-      x_full: [B,T,N_full,C]
-      mask:   [B,T,N_full,1] (1 for real node positions, 0 otherwise)
+    x_sub: [B,T,N_sub,C]
+    returns x_full: [B,T,N_full,C], mask: [B,T,N_full,1]
     """
     B, T, N_sub, C = x_sub.shape
     x_full = x_sub.new_zeros((B, T, N_full, C))
@@ -273,51 +297,55 @@ def pad_batch_to_full(x_sub: torch.Tensor, subset_idx: List[int], N_full: int):
     return x_full, mask
 
 # ================================================================
-# Train / Eval helpers (now compute MAE & RMSE)
+# Train / Eval (with IMF→trip reconstruction for loss & metrics)
 # ================================================================
-def _masked_mae(y_hat, y, mask=None):
+
+def _mae(a, b, mask=None):
     if mask is None:
-        return (y_hat - y).abs().mean()
-    else:
-        abs_diff = (y_hat - y).abs() * mask
-        return abs_diff.sum() / mask.sum().clamp_min(1.0)
+        return (a - b).abs().mean()
+    diff = (a - b).abs() * mask
+    return diff.sum() / mask.sum().clamp(min=1)
 
 
-def _masked_rmse(y_hat, y, mask=None):
+def _rmse(a, b, mask=None):
     if mask is None:
-        return torch.sqrt(((y_hat - y) ** 2).mean())
-    else:
-        sq = ((y_hat - y) ** 2) * mask
-        return torch.sqrt(sq.sum() / mask.sum().clamp_min(1.0))
+        return torch.sqrt(((a - b) ** 2).mean())
+    diff2 = ((a - b) ** 2) * mask
+    return torch.sqrt(diff2.sum() / mask.sum().clamp(min=1))
 
 
 def train_one_epoch(model, loader, optimizer, device, subset_idx=None, N_full=None):
     model.train()
-    total_loss = 0.0
-    total_count = 0
+    total_mae = 0.0
+    n_batches = 0
 
-    for x, y in loader:
+    for x, (y_imf, y_trips) in loader:
+        # x: [B,T_in,N,F], y_imf: [B,T_out,N,Kor1], y_trips: [B,T_out,N,1]
         if subset_idx is not None:
-            x_full, mask = pad_batch_to_full(x, subset_idx, N_full)
-            y_full, _ = pad_batch_to_full(y, subset_idx, N_full)
-            if mask.shape[1] != y_full.shape[1]:
-                mask = mask[:, :y_full.shape[1], :, :]
-            x, y, mask = to_device(x_full, device), to_device(y_full, device), to_device(mask, device)
+            x, mask = pad_batch_to_full(x, subset_idx, N_full)
+            y_imf, _ = pad_batch_to_full(y_imf, subset_idx, N_full)
+            y_trips, _ = pad_batch_to_full(y_trips, subset_idx, N_full)
+            # ensure mask time aligns with y_trips time
+            if mask.shape[1] != y_trips.shape[1]:
+                mask = mask[:, : y_trips.shape[1], :, :]
+            x, y_imf, y_trips, mask = to_device(x, device), to_device(y_imf, device), to_device(y_trips, device), to_device(mask, device)
         else:
             mask = None
-            x, y = to_device(x, device), to_device(y, device)
+            x, y_imf, y_trips = to_device(x, device), to_device(y_imf, device), to_device(y_trips, device)
 
         optimizer.zero_grad()
-        y_hat = model(x)
-        loss = _masked_mae(y_hat, y, mask)
+        y_hat_imf = model(x)                          # [B,T_out,N,Kor1]
+        y_hat_trips = y_hat_imf.sum(dim=-1, keepdim=True)  # reconstruct trips
+
+        loss = _mae(y_hat_trips, y_trips, mask=mask)
         loss.backward()
         nn.utils.clip_grad_norm_(model.parameters(), 5.0)
         optimizer.step()
 
-        total_loss += loss.item() * x.size(0)
-        total_count += x.size(0)
+        total_mae += loss.item()
+        n_batches += 1
 
-    return total_loss / max(total_count, 1)
+    return total_mae / max(n_batches, 1)
 
 
 @torch.no_grad()
@@ -325,41 +353,44 @@ def evaluate(model, loader, device, subset_idx=None, N_full=None):
     model.eval()
     total_mae = 0.0
     total_rmse = 0.0
-    total_batches = 0
+    n_batches = 0
 
-    for x, y in loader:
+    for x, (y_imf, y_trips) in loader:
         if subset_idx is not None:
-            x_full, mask = pad_batch_to_full(x, subset_idx, N_full)
-            y_full, _ = pad_batch_to_full(y, subset_idx, N_full)
-            if mask.shape[1] != y_full.shape[1]:
-                mask = mask[:, :y_full.shape[1], :, :]
-            x, y, mask = to_device(x_full, device), to_device(y_full, device), to_device(mask, device)
+            x, mask = pad_batch_to_full(x, subset_idx, N_full)
+            y_imf, _ = pad_batch_to_full(y_imf, subset_idx, N_full)
+            y_trips, _ = pad_batch_to_full(y_trips, subset_idx, N_full)
+            if mask.shape[1] != y_trips.shape[1]:
+                mask = mask[:, : y_trips.shape[1], :, :]
+            x, y_imf, y_trips, mask = to_device(x, device), to_device(y_imf, device), to_device(y_trips, device), to_device(mask, device)
         else:
             mask = None
-            x, y = to_device(x, device), to_device(y, device)
+            x, y_imf, y_trips = to_device(x, device), to_device(y_imf, device), to_device(y_trips, device)
 
-        y_hat = model(x)
-        mae = _masked_mae(y_hat, y, mask)
-        rmse = _masked_rmse(y_hat, y, mask)
-        total_mae += mae.item()
-        total_rmse += rmse.item()
-        total_batches += 1
+        y_hat_imf = model(x)
+        y_hat_trips = y_hat_imf.sum(dim=-1, keepdim=True)
 
-    if total_batches == 0:
-        return {"mae": float("nan"), "rmse": float("nan")}
-    return {"mae": total_mae / total_batches, "rmse": total_rmse / total_batches}
+        batch_mae = _mae(y_hat_trips, y_trips, mask=mask)
+        batch_rmse = _rmse(y_hat_trips, y_trips, mask=mask)
+        total_mae += batch_mae.item()
+        total_rmse += batch_rmse.item()
+        n_batches += 1
 
+    mae = total_mae / max(n_batches, 1)
+    rmse = total_rmse / max(n_batches, 1)
+    return mae, rmse
 
 # ================================================================
-# Algorithm 2: selective integration (evaluates candidate models on padded validation batches)
+# Algorithm 2: selective integration (unchanged API)
 # ================================================================
+
 def _copy_group(dst: nn.Module, src: nn.Module, group_name: str):
     dst_group = dst.modules_to_integrate[group_name]
     src_group = src.modules_to_integrate[group_name]
     dst_group.load_state_dict(src_group.state_dict())
 
 
-def selective_integration(local_model, global_model, val_loader, device, subset_idx: Optional[List[int]] = None, N_full: Optional[int] = None, groups=None):
+def selective_integration(local_model, global_model, val_loader, device, subset_idx=None, N_full=None, groups=None):
     if groups is None:
         groups = list(local_model.modules_to_integrate.keys())
 
@@ -370,8 +401,8 @@ def selective_integration(local_model, global_model, val_loader, device, subset_
     for g in groups:
         cand = copy.deepcopy(base)
         _copy_group(cand, global_model, g)
-        metrics = evaluate(cand, val_loader, device, subset_idx=subset_idx, N_full=N_full)
-        loss = metrics["mae"]
+        val_mae, _ = evaluate(cand, val_loader, device, subset_idx=subset_idx, N_full=N_full)
+        loss = val_mae
         if loss < best_loss:
             best_loss, best_group = loss, g
 
@@ -427,12 +458,13 @@ class FLClient:
         return evaluate(self.model, self.train_loader, self.device, subset_idx=self.subset_idx, N_full=self.N_full)
 
 class FLServer:
-    def __init__(self, model_fn, N_full: int):
+    def __init__(self, model_fn, clients: List[FLClient], N_full: int):
         self.global_model = model_fn()
+        self.clients = clients
         self.N_full = N_full
 
-    def distribute(self, clients: List[FLClient]):
-        for c in clients:
+    def distribute(self):
+        for c in self.clients:
             c.set_params_from(self.global_model)
 
     def aggregate_fedavg(self, states: List[Tuple[Dict, int]]):
@@ -445,6 +477,7 @@ class FLServer:
 # ================================================================
 # Federated loop with global metrics + plotting
 # ================================================================
+
 def run_federated(
     trip_csv: str,
     dataset_name: str,
@@ -456,8 +489,10 @@ def run_federated(
     save_dir: str = "./ckpts",
     epochs_per_round: int = 2,
     batch_size: int = 16,
-    use_attention: int = 0,
-    attn_heads: int = 3,
+    use_attention: bool = False,
+    attn_heads: int = 2,
+    vmd_k: int = 0,
+    save_vmd: bool = True,
 ):
     os.makedirs(save_dir, exist_ok=True)
     set_seed(42)
@@ -472,58 +507,65 @@ def run_federated(
     # round-robin split nodes among clients
     chunks = [node_indices[i::num_clients] for i in range(num_clients)]
 
-    def model_fn():
-        return LSTMDSTGCRN(num_nodes=N_full, input_dim=6, hidden_dim=64,
-                           output_dim=1, horizon=output_len, num_layers=1, emb_dim=16,
-                           use_attention=bool(use_attention), attn_heads=attn_heads)
+    # Derived input/output dims
+    input_dim = (vmd_k if vmd_k > 0 else 1) + 5  # primary stack + 5 aux features
+    output_dim = (vmd_k if vmd_k > 0 else 1)     # model predicts K IMFs or 1 trip channel
 
-    # build clients
+    def model_fn():
+        return LSTMDSTGCRN(
+            num_nodes=N_full,
+            input_dim=input_dim,
+            hidden_dim=64,
+            output_dim=output_dim,
+            horizon=output_len,
+            num_layers=1,
+            emb_dim=16,
+            use_attention=use_attention,
+            num_heads=attn_heads,
+        )
+
+    # build clients (datasets use possible node subsets)
     clients: List[FLClient] = []
     for cid, subset in enumerate(chunks):
-        full_ds = TripWeatherDataset(trip_csv, input_len, output_len, stride=1, node_subset=subset)
+        full_ds = TripWeatherDataset(trip_csv, input_len, output_len, stride=1, node_subset=subset, vmd_k=vmd_k, save_vmd=save_vmd and cid == 0)
         n_total = len(full_ds)
         if n_total == 0:
             raise ValueError(f"Client {cid} has no samples. Check node splitting and dataset shape.")
         n_tr = int(0.70 * n_total)
         n_va = int(0.15 * n_total)
         n_te = n_total - n_tr - n_va
-        tr, va, te = torch.utils.data.random_split(
-            full_ds, [n_tr, n_va, n_te], generator=torch.Generator().manual_seed(123 + cid)
-        )
+        tr, va, te = torch.utils.data.random_split(full_ds, [n_tr, n_va, n_te], generator=torch.Generator().manual_seed(123 + cid))
         cfg = ClientConfig(id=cid, epochs=epochs_per_round, batch_size=batch_size, lr=1e-3)
         clients.append(FLClient(cid, model_fn, tr, va, te, cfg, device, subset_idx=subset, N_full=N_full))
 
-    server = FLServer(model_fn, N_full=N_full)
+    server = FLServer(model_fn, clients, N_full=N_full)
 
-    # logs for paper-style
-    global_log = []     # [{round, global_mae, global_rmse, global_train_mae, global_train_rmse}, ...]
+    global_log = []
 
     for r in range(num_rounds):
         print(f"\n===== Round {r+1}/{num_rounds} | {dataset_name} =====")
 
-        # send current global model
-        server.distribute(clients)
+        server.distribute()
 
-        # client-side selective integration + local training
         for c in clients:
             c.integrate(server.global_model)
             c.train_local()
 
-        # Weighted global training metrics (evaluate on each client's TRAIN set)
+        # Weighted global training metrics (on each client's TRAIN set)
         train_metrics = [(c.train_metrics(), c.n_train()) for c in clients]
-        total_train = sum(n for _, n in train_metrics)
-        global_train_mae = sum(m["mae"] * n for m, n in train_metrics) / total_train
-        global_train_rmse = sum(m["rmse"] * n for m, n in train_metrics) / total_train
+        total_train = sum(n for (_, _), n in train_metrics)
+        global_train_mae = sum(m[0] * n for (m), n in train_metrics) / total_train
+        global_train_rmse = sum(m[1] * n for (m), n in train_metrics) / total_train
 
         # Evaluate test metrics per client
-        test_results = [(c.test_metrics(), c.n_test()) for c in clients]
-        total_test = sum(n for _, n in test_results)
-        global_mae = sum(m["mae"] * n for m, n in test_results) / total_test
-        global_rmse = sum(m["rmse"] * n for m, n in test_results) / total_test
+        test_metrics = [(c.test_metrics(), c.n_test()) for c in clients]
+        total_test = sum(n for (_, _), n in test_metrics)
+        global_mae = sum(m[0] * n for (m), n in test_metrics) / total_test
+        global_rmse = sum(m[1] * n for (m), n in test_metrics) / total_test
 
         print(f"Global MAE: {global_mae:.4f} | Global RMSE: {global_rmse:.4f} | Train MAE: {global_train_mae:.4f}")
         global_log.append({
-            "round": r,
+            "round": r + 1,
             "global_mae": float(global_mae),
             "global_rmse": float(global_rmse),
             "global_train_mae": float(global_train_mae),
@@ -540,17 +582,19 @@ def run_federated(
         json.dump(global_log, f, indent=2)
     print(f"Saved global results to {json_path}")
 
-    # Plot and save the curves for this dataset
+    # Plot curves
     rounds = [r["round"] for r in global_log]
     maes = [r["global_mae"] for r in global_log]
     rmses = [r["global_rmse"] for r in global_log]
+    train_maes = [r["global_train_mae"] for r in global_log]
 
     plt.figure()
-    plt.plot(rounds, maes, label=f"{dataset_name} MAE")
-    plt.plot(rounds, rmses, label=f"{dataset_name} RMSE")
+    plt.plot(rounds, maes, label="Test MAE")
+    plt.plot(rounds, rmses, label="Test RMSE")
+    plt.plot(rounds, train_maes, label="Train MAE")
     plt.xlabel("Round")
     plt.ylabel("Metric")
-    plt.title(f"Global Metrics ({dataset_name})")
+    plt.title(f"Metrics ({dataset_name})")
     plt.legend()
     png_path = os.path.join(save_dir, f"{dataset_name}_metrics.png")
     plt.savefig(png_path, bbox_inches="tight")
@@ -571,9 +615,11 @@ def main():
     ap.add_argument("--tout", type=int, default=3)
     ap.add_argument("--epochs_per_round", type=int, default=2)
     ap.add_argument("--batch_size", type=int, default=16)
-    ap.add_argument("--use_attention", type=int, default=0, help="1 to enable temporal MHA pre-encoder")
-    ap.add_argument("--attn_heads", type=int, default=4)
+    ap.add_argument("--use_attention", type=int, default=0)
+    ap.add_argument("--attn_heads", type=int, default=2)
     ap.add_argument("--save_dir", default="./ckpts")
+    ap.add_argument("--vmd_k", type=int, default=0, help="If >0, use VMD with K modes; model predicts K IMFs and we reconstruct for loss/metrics")
+    ap.add_argument("--save_vmd", type=int, default=1, help="Save VMD-preprocessed file once (client 0)")
     args = ap.parse_args()
 
     run_federated(
@@ -584,10 +630,12 @@ def main():
         input_len=args.tin,
         output_len=args.tout,
         epochs_per_round=args.epochs_per_round,
-        batch_size=args.batch_size,
-        use_attention=args.use_attention,
-        attn_heads=args.attn_heads,
         save_dir=args.save_dir,
+        batch_size=args.batch_size,
+        use_attention=bool(args.use_attention),
+        attn_heads=args.attn_heads,
+        vmd_k=args.vmd_k,
+        save_vmd=bool(args.save_vmd),
     )
 
 if __name__ == "__main__":
