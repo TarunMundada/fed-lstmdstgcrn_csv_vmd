@@ -1,0 +1,37 @@
+{
+    "experiment": "Federated_LSTM_DSTGCRN",
+    "datasets": {
+        "CHI-Taxi": {
+            "rounds": {
+                "1": {
+                    "epochs_completed": 1,
+                    "latest_metrics": {
+                        "MAE": 7.699897726376851,
+                        "RMSE": 31.847369375683012,
+                        "train_loss": 7.815834062559563,
+                        "val_loss": 31.847369375683012
+                    },
+                    "best_val_loss": {
+                        "epoch": 1,
+                        "value": 31.847369375683012
+                    },
+                    "log_file": "training_log.jsonl"
+                },
+                "2": {
+                    "epochs_completed": 1,
+                    "latest_metrics": {
+                        "MAE": 7.061768423943292,
+                        "RMSE": 29.616506833878773,
+                        "train_loss": 7.160843710732041,
+                        "val_loss": 29.616506833878773
+                    },
+                    "best_val_loss": {
+                        "epoch": 1,
+                        "value": 29.616506833878773
+                    },
+                    "log_file": "training_log.jsonl"
+                }
+            }
+        }
+    }
+}

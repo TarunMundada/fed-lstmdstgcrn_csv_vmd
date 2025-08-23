@@ -473,43 +473,106 @@ class FLServer:
         for k in new_sd.keys():
             new_sd[k] = sum(sd[k] * (n/total) for sd, n in states)
         self.global_model.load_state_dict(new_sd)
+        
+# ================================================================
+LOG_JSONL = "training_log.jsonl"
+MASTER_JSON = "master_index.json"
+
+
+def log_epoch(experiment, dataset, round_id, epoch, metrics, resources, preds_file, signals_file):
+# --- 1. Append epoch record to JSONL ---
+    record = {
+    "experiment": experiment,
+    "dataset": dataset,
+    "round": round_id,
+    "epoch": epoch,
+    "metrics": metrics,
+    "resources": resources,
+    "artifacts": {
+    "predictions_file": preds_file,
+    "signals_file": signals_file
+    }
+    }
+    with open(LOG_JSONL, "a") as f:
+        f.write(json.dumps(record) + "\n")
+
+
+    # --- 2. Update master summary JSON ---
+    if os.path.exists(MASTER_JSON):
+        with open(MASTER_JSON, "r") as f:
+            master = json.load(f)
+    else:
+        master = {"experiment": experiment, "datasets": {}}
+
+
+    d = master["datasets"].setdefault(dataset, {"rounds": {}})
+    r = d["rounds"].setdefault(str(round_id), {
+    "epochs_completed": 0,
+    "latest_metrics": {},
+    "best_val_loss": {"epoch": None, "value": float("inf")},
+    "log_file": LOG_JSONL
+    })
+
+
+    r["epochs_completed"] = epoch
+    r["latest_metrics"] = metrics
+    if metrics.get("val_loss", float("inf")) < r["best_val_loss"]["value"]:
+        r["best_val_loss"] = {"epoch": epoch, "value": metrics["val_loss"]}
+
+
+    with open(MASTER_JSON, "w") as f:
+        json.dump(master, f, indent=4)
+        
+def save_artifacts(dataset, round_num, epoch, y_true, y_pred, signals=None):
+    os.makedirs("artifacts", exist_ok=True)
+
+    preds_file = f"artifacts/{dataset}_round{round_num}_epoch{epoch}_preds.npz"
+    np.savez(preds_file, y_true=y_true, y_pred=y_pred)
+
+    signals_file = None
+    if signals is not None:
+        signals_file = f"artifacts/{dataset}_round{round_num}_epoch{epoch}_signals.npz"
+        np.savez(signals_file, signals=signals)
+
+    return preds_file, signals_file
 
 # ================================================================
 # Federated loop with global metrics + plotting
 # ================================================================
 
 def run_federated(
-    trip_csv: str,
-    dataset_name: str,
-    num_clients: int = 3,
-    num_rounds: int = 10,
-    input_len: int = 12,
-    output_len: int = 3,
-    device: str = None,
-    save_dir: str = "./ckpts",
-    epochs_per_round: int = 2,
-    batch_size: int = 16,
-    use_attention: bool = False,
-    attn_heads: int = 2,
-    vmd_k: int = 0,
-    save_vmd: bool = True,
+trip_csv: str,
+dataset_name: str,
+num_clients: int = 3,
+num_rounds: int = 10,
+input_len: int = 12,
+output_len: int = 3,
+device: str = None,
+save_dir: str = "./ckpts",
+epochs_per_round: int = 2,
+batch_size: int = 16,
+use_attention: bool = False,
+attn_heads: int = 2,
+vmd_k: int = 0,
+save_vmd: bool = True,
 ):
     os.makedirs(save_dir, exist_ok=True)
     set_seed(42)
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
 
-    # infer N (nodes) and build node index list [0..N-1]
+
     tmp = pd.read_csv(trip_csv, nrows=1)
     node_cols = [c for c in tmp.columns if c != "timestamp"]
     N_full = len(node_cols)
     node_indices = list(range(N_full))
 
-    # round-robin split nodes among clients
+
     chunks = [node_indices[i::num_clients] for i in range(num_clients)]
 
-    # Derived input/output dims
-    input_dim = (vmd_k if vmd_k > 0 else 1) + 5  # primary stack + 5 aux features
-    output_dim = (vmd_k if vmd_k > 0 else 1)     # model predicts K IMFs or 1 trip channel
+
+    input_dim = (vmd_k if vmd_k > 0 else 1) + 5
+    output_dim = (vmd_k if vmd_k > 0 else 1)
+
 
     def model_fn():
         return LSTMDSTGCRN(
@@ -523,8 +586,6 @@ def run_federated(
             use_attention=use_attention,
             num_heads=attn_heads,
         )
-
-    # build clients (datasets use possible node subsets)
     clients: List[FLClient] = []
     for cid, subset in enumerate(chunks):
         full_ds = TripWeatherDataset(trip_csv, input_len, output_len, stride=1, node_subset=subset, vmd_k=vmd_k, save_vmd=save_vmd and cid == 0)
@@ -538,9 +599,10 @@ def run_federated(
         cfg = ClientConfig(id=cid, epochs=epochs_per_round, batch_size=batch_size, lr=1e-3)
         clients.append(FLClient(cid, model_fn, tr, va, te, cfg, device, subset_idx=subset, N_full=N_full))
 
-    server = FLServer(model_fn, clients, N_full=N_full)
 
+    server = FLServer(model_fn, clients, N_full=N_full)
     global_log = []
+
 
     for r in range(num_rounds):
         print(f"\n===== Round {r+1}/{num_rounds} | {dataset_name} =====")
@@ -551,55 +613,71 @@ def run_federated(
             c.integrate(server.global_model)
             c.train_local()
 
-        # Weighted global training metrics (on each client's TRAIN set)
+
         train_metrics = [(c.train_metrics(), c.n_train()) for c in clients]
         total_train = sum(n for (_, _), n in train_metrics)
         global_train_mae = sum(m[0] * n for (m), n in train_metrics) / total_train
         global_train_rmse = sum(m[1] * n for (m), n in train_metrics) / total_train
 
-        # Evaluate test metrics per client
+
         test_metrics = [(c.test_metrics(), c.n_test()) for c in clients]
         total_test = sum(n for (_, _), n in test_metrics)
         global_mae = sum(m[0] * n for (m), n in test_metrics) / total_test
         global_rmse = sum(m[1] * n for (m), n in test_metrics) / total_test
 
+
         print(f"Global MAE: {global_mae:.4f} | Global RMSE: {global_rmse:.4f} | Train MAE: {global_train_mae:.4f}")
         global_log.append({
-            "round": r + 1,
-            "global_mae": float(global_mae),
-            "global_rmse": float(global_rmse),
-            "global_train_mae": float(global_train_mae),
-            "global_train_rmse": float(global_train_rmse),
+        "round": r + 1,
+        "global_mae": float(global_mae),
+        "global_rmse": float(global_rmse),
+        "global_train_mae": float(global_train_mae),
+        "global_train_rmse": float(global_train_rmse),
         })
 
-        # FedAvg aggregation (weighted by train samples)
+
+        # ==== LOGGING per round (summary only) ====
+        metrics = {
+        "MAE": float(global_mae),
+        "RMSE": float(global_rmse),
+        "train_loss": float(global_train_mae),
+        "val_loss": float(global_rmse) # using RMSE as proxy for val_loss here
+        }
+        resources = {"runtime_sec": 0.0, "gpu_memory_mb": 0} # extend with actual if measured
+        preds_file = f"{dataset_name}_round{r+1}_preds.npz"
+        signals_file = f"{dataset_name}_round{r+1}_signals.npz"
+        log_epoch("Federated_LSTM_DSTGCRN", dataset_name, r+1, 1, metrics, resources, preds_file, signals_file)
+
+
+
         states = [(c.state_dict(), c.n_train()) for c in clients]
         server.aggregate_fedavg(states)
 
-    # Save results for this dataset
-    json_path = os.path.join(save_dir, f"{dataset_name}_global_results.json")
-    with open(json_path, "w") as f:
-        json.dump(global_log, f, indent=2)
-    print(f"Saved global results to {json_path}")
 
-    # Plot curves
-    rounds = [r["round"] for r in global_log]
-    maes = [r["global_mae"] for r in global_log]
-    rmses = [r["global_rmse"] for r in global_log]
-    train_maes = [r["global_train_mae"] for r in global_log]
+        json_path = os.path.join(save_dir, f"{dataset_name}_global_results.json")
+        with open(json_path, "w") as f:
+            json.dump(global_log, f, indent=2)
+        print(f"Saved global results to {json_path}")
 
-    plt.figure()
-    plt.plot(rounds, maes, label="Test MAE")
-    plt.plot(rounds, rmses, label="Test RMSE")
-    plt.plot(rounds, train_maes, label="Train MAE")
-    plt.xlabel("Round")
-    plt.ylabel("Metric")
-    plt.title(f"Metrics ({dataset_name})")
-    plt.legend()
-    png_path = os.path.join(save_dir, f"{dataset_name}_metrics.png")
-    plt.savefig(png_path, bbox_inches="tight")
-    plt.close()
-    print(f"Saved metrics curves to {png_path}")
+
+        rounds = [r["round"] for r in global_log]
+        maes = [r["global_mae"] for r in global_log]
+        rmses = [r["global_rmse"] for r in global_log]
+        train_maes = [r["global_train_mae"] for r in global_log]
+
+
+        plt.figure()
+        plt.plot(rounds, maes, label="Test MAE")
+        plt.plot(rounds, rmses, label="Test RMSE")
+        plt.plot(rounds, train_maes, label="Train MAE")
+        plt.xlabel("Round")
+        plt.ylabel("Metric")
+        plt.title(f"Metrics ({dataset_name})")
+        plt.legend()
+        png_path = os.path.join(save_dir, f"{dataset_name}_metrics.png")
+        plt.savefig(png_path, bbox_inches="tight")
+        plt.close()
+        print(f"Saved metrics curves to {png_path}")
 
 # ================================================================
 # CLI
